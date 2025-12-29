@@ -1,0 +1,91 @@
+name: Production Deployment (Rsync + Zero Downtime)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/web/**"
+      - ".github/workflows/prod-deploy.yml"
+
+concurrency:
+  group: ${{ github.repository }}-prod
+  cancel-in-progress: true
+
+jobs:
+  prod-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Build your Next.js app in Standalone mode
+      - name: Build project
+        run: npm run build
+        env:
+          # If using Turbo, ensure you target the specific app
+          # npm run build --filter=web...
+          NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL }}
+
+      - name: Prepare deployment artifacts
+        run: |
+          mkdir -p deploy_package
+          # 1. Copy the standalone server
+          cp -r apps/web/.next/standalone/. deploy_package/
+          # 2. Copy static assets (images, css, js chunks)
+          cp -r apps/web/.next/static deploy_package/.next/static
+          cp -r apps/web/public deploy_package/public
+          # 3. Copy the ecosystem file for PM2
+          cp ecosystem.config.js deploy_package/
+
+      - name: Set up SSH Agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Sync Files to Server (Secure Rsync)
+        run: |
+          # Create the known_hosts file to prevent interactive prompts
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.DROPLET_IP }} >> ~/.ssh/known_hosts
+          
+          # Ensure the target directory exists on the server
+          ssh ${{ secrets.DROPLET_USER }}@${{ secrets.DROPLET_IP }} "mkdir -p /home/${{ secrets.DROPLET_USER }}/app"
+          
+          # Native rsync command
+          # -a: archive mode (preserves permissions/times)
+          # -v: verbose
+          # -z: compress file data during transfer
+          # --delete: remove files on server that were deleted in git
+          rsync -avz --delete ./deploy_package/ ${{ secrets.DROPLET_USER }}@${{ secrets.DROPLET_IP }}:/home/${{ secrets.DROPLET_USER }}/app/
+
+      - name: Reload Application (Zero Downtime)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DROPLET_IP }}
+          username: ${{ secrets.DROPLET_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            # Load NVM (Node Version Manager)
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+            
+            # Ensure app directory exists
+            mkdir -p /home/${{ secrets.DROPLET_USER }}/app
+            cd /home/${{ secrets.DROPLET_USER }}/app
+            
+            # Start or Reload PM2
+            # 'reload' updates the code zero-downtime. 
+            # If the app isn't running, 'start' launches it.
+            pm2 reload ecosystem.config.js --update-env || pm2 start ecosystem.config.js
+            
+            # Save the process list so it comes back on reboot
+            pm2 save
